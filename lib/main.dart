@@ -90,11 +90,10 @@ class App extends StatelessWidget {
     debugShowCheckedModeBanner: false,
     theme: ThemeData(
       fontFamily: "latefff",
-      
+
       brightness: Brightness.dark,
       scaffoldBackgroundColor: bg,
       colorScheme: const ColorScheme.dark(primary: Color(0xFF7B6CFF)),
-    
     ),
     builder: (c, child) =>
         Directionality(textDirection: TextDirection.rtl, child: child!),
@@ -399,7 +398,6 @@ class _HomeState extends State<Home> {
       floatingActionButton: Padding(
         padding: EdgeInsets.only(bottom: _current != null ? 150 : 0),
         child: FloatingActionButton.extended(
-          
           onPressed: () => _openEditor(),
           icon: const Icon(Icons.add),
           label: const Text('صوت جديد'),
@@ -800,11 +798,11 @@ class _EditorState extends State<Editor> {
   String? _srcPath, _fileName, _error;
 
   Future<void> _pick() async {
-    final r = await FilePicker.platform.pickFiles(type: FileType.audio);
-    if (r?.files.single.path == null) return;
+    final f = await FilePicker.pickFile(type: FileType.audio);
+    if (f?.path == null) return;
     setState(() {
-      _srcPath = r!.files.single.path;
-      _fileName = r.files.single.name;
+      _srcPath = f!.path;
+      _fileName = f.name;
       _error = null;
       if (_name.text.isEmpty) {
         _name.text = _fileName!.replaceAll(RegExp(r'\.[^.]+$'), '');
