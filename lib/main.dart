@@ -43,6 +43,9 @@ const icons = <IconData>[
   Icons.piano,
 ];
 const speeds = <double>[0.5, 0.75, 1, 1.25, 1.5, 2];
+const textScale = 1.1; // غيّر الرقم لتكبير أو تصغير الخط في التطبيق كله
+
+bool _isAbs(String p) => p.contains('/') || p.contains('\\');
 
 // ───────── الموديل ─────────
 class SoundItem {
@@ -70,9 +73,9 @@ class SoundItem {
     'fav': fav,
   };
   factory SoundItem.fromJson(Map<String, dynamic> j) => SoundItem(
-    id: j['id'],
-    name: j['name'],
-    path: j['path'],
+    id: '${j['id']}',
+    name: '${j['name']}',
+    path: '${j['path']}',
     category: j['category'] ?? '',
     color: j['color'] ?? 0,
     icon: j['icon'] ?? 0,
@@ -81,7 +84,10 @@ class SoundItem {
   );
 }
 
-void main() => runApp(const App());
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const App());
+}
 
 class App extends StatelessWidget {
   const App({super.key});
@@ -90,13 +96,15 @@ class App extends StatelessWidget {
     debugShowCheckedModeBanner: false,
     theme: ThemeData(
       fontFamily: "latefff",
-
       brightness: Brightness.dark,
       scaffoldBackgroundColor: bg,
       colorScheme: const ColorScheme.dark(primary: Color(0xFF7B6CFF)),
     ),
-    builder: (c, child) =>
-        Directionality(textDirection: TextDirection.rtl, child: child!),
+    builder: (c, child) => MediaQuery(
+      data: MediaQuery.of(c)
+          .copyWith(textScaler: const TextScaler.linear(textScale)),
+      child: Directionality(textDirection: TextDirection.rtl, child: child!),
+    ),
     home: const Home(),
   );
 }
@@ -109,15 +117,24 @@ class Home extends StatefulWidget {
 
 class _HomeState extends State<Home> {
   AudioPlayer _player = AudioPlayer();
-  final List<AudioPlayer> _extras = []; // أصوات شغالة مع بعض (وضع المزج)
+  final List<AudioPlayer> _extras = [];
   final List<StreamSubscription> _subs = [];
   List<SoundItem> _sounds = [];
   SoundItem? _current;
-  bool _playing = false, _loop = false, _overlap = false;
+  bool _playing = false, _loop = false, _overlap = false, _loaded = false;
   double _volume = 1, _speed = 1;
   int _cols = 2, _sort = 0;
   String _query = '', _filter = 'all';
   Duration _pos = Duration.zero, _dur = Duration.zero;
+
+  // التخزين
+  String? _dir; // مجلد التطبيق الدائم
+  Future<void> _saveChain = Future.value();
+
+  String? get _dbPath => _dir == null ? null : '$_dir/soundboard.json';
+  String? get _soundsDir => _dir == null ? null : '$_dir/sounds';
+  String _full(SoundItem s) =>
+      _isAbs(s.path) ? s.path : '$_soundsDir/${s.path}';
 
   @override
   void initState() {
@@ -160,78 +177,156 @@ class _HomeState extends State<Home> {
       ]);
   }
 
-  // ───── التخزين ─────
-  Future<void> _load() async {
-    final p = await SharedPreferences.getInstance();
-    final data = p.getStringList('sounds') ?? [];
-    setState(() {
-      _sounds = data.map((e) => SoundItem.fromJson(jsonDecode(e))).toList();
-      _volume = p.getDouble('volume') ?? 1;
-      _speed = p.getDouble('speed') ?? 1;
-      _loop = p.getBool('loop') ?? false;
-      _overlap = p.getBool('overlap') ?? false;
-      _cols = p.getInt('cols') ?? 2;
-      _sort = p.getInt('sort') ?? 0;
-    });
+  // ───────── التخزين: ملف JSON + نسخة احتياطية + SharedPreferences ─────────
+  Map<String, dynamic>? _parse(String? raw) {
+    if (raw == null || raw.trim().isEmpty) return null;
+    try {
+      final m = jsonDecode(raw);
+      return m is Map<String, dynamic> ? m : null;
+    } catch (_) {
+      return null;
+    }
   }
 
-  Future<void> _save() async {
-    final p = await SharedPreferences.getInstance();
-    await p.setStringList(
-      'sounds',
-      _sounds.map((e) => jsonEncode(e.toJson())).toList(),
-    );
-    await p.setDouble('volume', _volume);
-    await p.setDouble('speed', _speed);
-    await p.setBool('loop', _loop);
-    await p.setBool('overlap', _overlap);
-    await p.setInt('cols', _cols);
-    await p.setInt('sort', _sort);
+  Future<void> _load() async {
+    SharedPreferences? prefs;
+    try {
+      prefs = await SharedPreferences.getInstance();
+    } catch (_) {}
+    try {
+      final d = await getApplicationSupportDirectory();
+      await Directory('${d.path}/sounds').create(recursive: true);
+      _dir = d.path;
+    } catch (_) {}
+
+    // نجرّب بالترتيب: الملف الأساسي، النسخة الاحتياطية، SharedPreferences
+    Map<String, dynamic>? db;
+    final path = _dbPath;
+    if (path != null) {
+      for (final p in [path, '$path.bak']) {
+        try {
+          final f = File(p);
+          if (await f.exists()) db ??= _parse(await f.readAsString());
+        } catch (_) {}
+      }
+    }
+    db ??= _parse(prefs?.getString('db'));
+
+    var list = <SoundItem>[];
+    final s = (db?['settings'] as Map?) ?? {};
+    if (db != null) {
+      for (final e in (db['sounds'] as List? ?? [])) {
+        try {
+          list.add(SoundItem.fromJson(Map<String, dynamic>.from(e)));
+        } catch (_) {}
+      }
+    } else {
+      // دعم نسخة التخزين القديمة
+      for (final e in (prefs?.getStringList('sounds') ?? [])) {
+        try {
+          list.add(SoundItem.fromJson(jsonDecode(e)));
+        } catch (_) {}
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _sounds = list;
+      _volume = ((s['volume'] ?? 1) as num).toDouble().clamp(0.0, 1.0);
+      _speed = ((s['speed'] ?? 1) as num).toDouble();
+      if (!speeds.contains(_speed)) _speed = 1;
+      _loop = s['loop'] ?? false;
+      _overlap = s['overlap'] ?? false;
+      _cols = ((s['cols'] ?? 2) as num).toInt().clamp(1, 3);
+      _sort = ((s['sort'] ?? 0) as num).toInt().clamp(0, 2);
+      _loaded = true;
+    });
+    if (db == null && list.isNotEmpty) _save(); // ترحيل البيانات القديمة
+  }
+
+  void _save() {
+    if (!_loaded) return; // ما نحفظش قبل ما التحميل يخلص
+    final raw = jsonEncode({
+      'v': 2,
+      'settings': {
+        'volume': _volume,
+        'speed': _speed,
+        'loop': _loop,
+        'overlap': _overlap,
+        'cols': _cols,
+        'sort': _sort,
+      },
+      'sounds': _sounds.map((e) => e.toJson()).toList(),
+    });
+    // الحفظ بيتنفذ بالدور عشان ما يحصلش تداخل
+    _saveChain = _saveChain.then((_) => _write(raw));
+  }
+
+  Future<void> _write(String raw) async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setString('db', raw);
+    } catch (_) {}
+    final path = _dbPath;
+    if (path == null) return;
+    try {
+      final tmp = File('$path.tmp');
+      await tmp.writeAsString(raw, flush: true);
+      final main = File(path);
+      if (await main.exists()) await main.copy('$path.bak');
+      await tmp.rename(path);
+    } catch (_) {}
   }
 
   void _toast(String msg) {
+    if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  // ───── التشغيل ─────
+  // ───────── التشغيل ─────────
   Future<void> _play(SoundItem item) async {
     HapticFeedback.lightImpact();
-    if (!File(item.path).existsSync()) {
+    if (!File(_full(item)).existsSync()) {
       _toast('ملف الصوت مش موجود، عدّل الزر واختار الملف تاني');
       return;
     }
-    if (_overlap && _current != null && _playing) {
-      // نسيب الصوت القديم يكمل ونبدأ صوت جديد فوقه
-      final old = _player;
-      _extras.add(old);
-      old.onPlayerComplete.first
-          .then((_) {
-            _extras.remove(old);
-            old.dispose();
-          })
-          .catchError((_) {});
-      _player = AudioPlayer();
-      _attach(_player);
-    } else {
-      await _player.stop();
+    try {
+      if (_overlap && _current != null && _playing) {
+        final old = _player;
+        _extras.add(old);
+        old.onPlayerComplete.first
+            .then((_) {
+              _extras.remove(old);
+              old.dispose();
+            })
+            .catchError((_) {});
+        _player = AudioPlayer();
+        _attach(_player);
+      } else {
+        await _player.stop();
+      }
+      item.plays++;
+      setState(() => _current = item);
+      _save();
+      await _player.setReleaseMode(_loop ? ReleaseMode.loop : ReleaseMode.stop);
+      await _player.setPlaybackRate(_speed);
+      await _player.play(DeviceFileSource(_full(item)), volume: _volume);
+    } catch (_) {
+      _toast('حصلت مشكلة في تشغيل الصوت');
     }
-    item.plays++;
-    setState(() => _current = item);
-    _save();
-    await _player.setReleaseMode(_loop ? ReleaseMode.loop : ReleaseMode.stop);
-    await _player.setPlaybackRate(_speed);
-    await _player.play(DeviceFileSource(item.path), volume: _volume);
   }
 
   Future<void> _stopAll() async {
     for (final p in _extras) {
-      await p.stop();
-      await p.dispose();
+      try {
+        await p.stop();
+        await p.dispose();
+      } catch (_) {}
     }
     _extras.clear();
     await _player.stop();
+    if (!mounted) return;
     setState(() {
       _current = null;
       _pos = Duration.zero;
@@ -251,13 +346,8 @@ class _HomeState extends State<Home> {
     _play(list[Random().nextInt(list.length)]);
   }
 
-  // ───── إضافة / تعديل / حذف ─────
+  // ───────── إضافة / تعديل / حذف ─────────
   Future<void> _openEditor([SoundItem? existing]) async {
-    final cats = _sounds
-        .map((e) => e.category)
-        .where((e) => e.isNotEmpty)
-        .toSet()
-        .toList();
     final result = await showModalBottomSheet<SoundItem>(
       context: context,
       isScrollControlled: true,
@@ -265,9 +355,13 @@ class _HomeState extends State<Home> {
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
       ),
-      builder: (_) => Editor(existing: existing, categories: cats),
+      builder: (_) =>
+          Editor(existing: existing, categories: _cats, soundsDir: _soundsDir),
     );
     if (result == null) return;
+    if (existing != null && existing.path != result.path) {
+      _deleteOwnedFile(existing); // نمسح الملف القديم لو اتغير
+    }
     setState(() {
       if (existing == null) {
         _sounds.add(result);
@@ -281,6 +375,13 @@ class _HomeState extends State<Home> {
       }
     });
     _save();
+  }
+
+  void _deleteOwnedFile(SoundItem item) {
+    if (_isAbs(item.path) || _soundsDir == null) return; // مش ملفنا
+    try {
+      File(_full(item)).delete();
+    } catch (_) {}
   }
 
   Future<void> _confirmDelete(SoundItem item) async {
@@ -305,12 +406,7 @@ class _HomeState extends State<Home> {
     );
     if (ok != true) return;
     if (_current?.id == item.id) await _stopAll();
-    final shared = _sounds.any((e) => e.id != item.id && e.path == item.path);
-    if (!shared && item.path.contains(item.id)) {
-      try {
-        await File(item.path).delete(); // نمسح بس النسخة اللي عملناها
-      } catch (_) {}
-    }
+    _deleteOwnedFile(item);
     setState(() => _sounds.removeWhere((e) => e.id == item.id));
     _save();
   }
@@ -367,7 +463,7 @@ class _HomeState extends State<Home> {
     );
   }
 
-  // ───── الفلترة والترتيب ─────
+  // ───────── الفلترة والترتيب ─────────
   List<String> get _cats => _sounds
       .map((e) => e.category)
       .where((e) => e.isNotEmpty)
@@ -375,7 +471,7 @@ class _HomeState extends State<Home> {
       .toList();
 
   List<SoundItem> get _visible {
-    var l = _sounds.where((e) => e.name.contains(_query)).where((e) {
+    final l = _sounds.where((e) => e.name.contains(_query)).where((e) {
       if (_filter == 'all') return true;
       if (_filter == 'fav') return e.fav;
       return e.category == _filter;
@@ -385,7 +481,7 @@ class _HomeState extends State<Home> {
     return [...l.where((e) => e.fav), ...l.where((e) => !e.fav)];
   }
 
-  // ───── الواجهة ─────
+  // ───────── الواجهة ─────────
   @override
   Widget build(BuildContext context) {
     if (_filter != 'all' && _filter != 'fav' && !_cats.contains(_filter)) {
@@ -393,10 +489,10 @@ class _HomeState extends State<Home> {
     }
     final items = _visible;
     final totalPlays = _sounds.fold<int>(0, (a, e) => a + e.plays);
-    final extra = _current != null ? 190.0 : 100.0;
+    final bottomSpace = _current != null ? 200.0 : 100.0;
     return Scaffold(
       floatingActionButton: Padding(
-        padding: EdgeInsets.only(bottom: _current != null ? 150 : 0),
+        padding: EdgeInsets.only(bottom: _current != null ? 160 : 0),
         child: FloatingActionButton.extended(
           onPressed: () => _openEditor(),
           icon: const Icon(Icons.add),
@@ -466,10 +562,9 @@ class _HomeState extends State<Home> {
                     ),
                   ),
                 ),
-                // شريط الفلاتر
                 SliverToBoxAdapter(
                   child: SizedBox(
-                    height: 44,
+                    height: 48,
                     child: ListView(
                       scrollDirection: Axis.horizontal,
                       padding: const EdgeInsets.symmetric(horizontal: 20),
@@ -481,7 +576,6 @@ class _HomeState extends State<Home> {
                     ),
                   ),
                 ),
-                // أدوات التحكم
                 SliverToBoxAdapter(
                   child: Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -538,7 +632,12 @@ class _HomeState extends State<Home> {
                     ),
                   ),
                 ),
-                if (items.isEmpty)
+                if (!_loaded)
+                  const SliverFillRemaining(
+                    hasScrollBody: false,
+                    child: Center(child: CircularProgressIndicator()),
+                  )
+                else if (items.isEmpty)
                   SliverFillRemaining(
                     hasScrollBody: false,
                     child: Center(
@@ -552,15 +651,15 @@ class _HomeState extends State<Home> {
                   )
                 else
                   SliverPadding(
-                    padding: EdgeInsets.fromLTRB(20, 8, 20, extra),
+                    padding: EdgeInsets.fromLTRB(20, 8, 20, bottomSpace),
                     sliver: SliverGrid.builder(
                       gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
                         crossAxisCount: _cols,
                         crossAxisSpacing: 14,
                         mainAxisSpacing: 14,
                         childAspectRatio: _cols == 1
-                            ? 3.6
-                            : (_cols == 2 ? 1.05 : 0.95),
+                            ? 3.4
+                            : (_cols == 2 ? 0.95 : 0.8),
                       ),
                       itemCount: items.length,
                       itemBuilder: (_, i) => _pad(items[i]),
@@ -588,19 +687,20 @@ class _HomeState extends State<Home> {
     final c = palette[s.color % palette.length];
     final active = _current?.id == s.id && _playing;
     final icon = active ? Icons.graphic_eq : icons[s.icon % icons.length];
-    final nameStyle = TextStyle(
-      fontSize: _cols == 3 ? 14 : 18,
-      fontWeight: FontWeight.w700,
-      color: Colors.white,
-    );
     final name = Text(
       s.name,
       maxLines: 2,
       overflow: TextOverflow.ellipsis,
-      style: nameStyle,
+      style: TextStyle(
+        fontSize: _cols == 3 ? 14 : 18,
+        fontWeight: FontWeight.w700,
+        color: Colors.white,
+      ),
     );
     final meta = Text(
       [if (s.category.isNotEmpty) s.category, '${s.plays}×'].join('  •  '),
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
       style: const TextStyle(fontSize: 11, color: Colors.white70),
     );
     return GestureDetector(
@@ -761,7 +861,6 @@ class _HomeState extends State<Home> {
                   onChangeEnd: (_) => _save(),
                 ),
               ),
-              // السرعة: ضغطة = السرعة اللي بعدها
               TextButton(
                 onPressed: () async {
                   final i = speeds.indexOf(_speed);
@@ -783,7 +882,13 @@ class _HomeState extends State<Home> {
 class Editor extends StatefulWidget {
   final SoundItem? existing;
   final List<String> categories;
-  const Editor({super.key, this.existing, this.categories = const []});
+  final String? soundsDir;
+  const Editor({
+    super.key,
+    this.existing,
+    this.categories = const [],
+    this.soundsDir,
+  });
   @override
   State<Editor> createState() => _EditorState();
 }
@@ -796,6 +901,14 @@ class _EditorState extends State<Editor> {
   late int _color = widget.existing?.color ?? 0;
   late int _icon = widget.existing?.icon ?? 0;
   String? _srcPath, _fileName, _error;
+  bool _busy = false;
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _cat.dispose();
+    super.dispose();
+  }
 
   Future<void> _pick() async {
     final f = await FilePicker.pickFile(type: FileType.audio);
@@ -811,26 +924,35 @@ class _EditorState extends State<Editor> {
   }
 
   Future<void> _submit() async {
+    if (_busy) return;
     final name = _name.text.trim();
     if (name.isEmpty) {
       setState(() => _error = 'اكتب اسم للزر');
       return;
     }
+    setState(() => _busy = true);
     final id =
         widget.existing?.id ?? DateTime.now().millisecondsSinceEpoch.toString();
     var path = widget.existing?.path ?? '';
     if (_srcPath != null) {
-      try {
-        // ننسخ الملف لمكان دائم عشان ما يضيعش
-        final dir = await getApplicationDocumentsDirectory();
-        path = '${dir.path}/${id}_$_fileName';
-        await File(_srcPath!).copy(path);
-      } catch (_) {
-        path = _srcPath!; // لو النسخ فشل نستخدم المسار الأصلي
+      var saved = false;
+      if (widget.soundsDir != null) {
+        try {
+          // ننسخ الملف جوه التطبيق ونخزن اسمه بس (مسار نسبي)
+          final safe = _fileName!.replaceAll(RegExp(r'[^\w\.\-]'), '_');
+          final rel = '${id}_${DateTime.now().millisecondsSinceEpoch}_$safe';
+          await File(_srcPath!).copy('${widget.soundsDir}/$rel');
+          path = rel;
+          saved = true;
+        } catch (_) {}
       }
+      if (!saved) path = _srcPath!; // لو النسخ فشل نستخدم المسار الأصلي
     }
     if (path.isEmpty) {
-      setState(() => _error = 'اختار ملف صوت');
+      setState(() {
+        _error = 'اختار ملف صوت';
+        _busy = false;
+      });
       return;
     }
     if (!mounted) return;
@@ -948,10 +1070,10 @@ class _EditorState extends State<Editor> {
             SizedBox(
               width: double.infinity,
               child: FilledButton(
-                onPressed: _submit,
-                child: const Padding(
-                  padding: EdgeInsets.all(12),
-                  child: Text('حفظ'),
+                onPressed: _busy ? null : _submit,
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Text(_busy ? 'جاري الحفظ...' : 'حفظ'),
                 ),
               ),
             ),
